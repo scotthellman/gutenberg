@@ -1,0 +1,15 @@
+[project]
+name = "gutenberg-rag"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "beautifulsoup4>=4.14.3",
+    "chromadb>=1.5.5",
+    "langchain>=1.2.13",
+    "langchain-ollama>=1.0.1",
+    "libzim>=3.9.0",
+    "ollama>=0.6.1",
+    "zimscraperlib>=5.2.0",
+]
