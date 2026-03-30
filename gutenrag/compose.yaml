@@ -1,0 +1,54 @@
+services:
+  ollama:
+    image: ollama/ollama:${OLLAMA_IMAGE_TAG:-latest}
+    container_name: ollama
+    restart: unless-stopped
+
+    # Keep it local by default, expose it later if you need to.
+    ports:
+      - "${OLLAMA_BIND_IP:-127.0.0.1}:11434:11434"
+
+    # Persistent models and server state.
+    volumes:
+      - ollama:/root/.ollama
+
+    environment:
+      # The official image already defaults to 0.0.0.0:11434 inside the container,
+      # but keeping it explicit helps when you override things later.
+      - OLLAMA_HOST=0.0.0.0:11434
+
+      # Service tuning.
+      - OLLAMA_KEEP_ALIVE=${OLLAMA_KEEP_ALIVE:-5m}
+      - OLLAMA_NUM_PARALLEL=${OLLAMA_NUM_PARALLEL:-1}
+      - OLLAMA_MAX_LOADED_MODELS=${OLLAMA_MAX_LOADED_MODELS:-1}
+
+      # Optional, but relevant when a browser-based UI talks to Ollama directly.
+      # See the Networking section for why this exists.
+      - OLLAMA_ORIGINS=${OLLAMA_ORIGINS:-}
+
+    # GPU reservation is a separate section below.
+    # Add it only on hosts that actually have NVIDIA GPUs.
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  pgvector:
+    image: pgvector/pgvector:pg18-trixie
+    container_name: pgvector
+    restart: unless-stopped
+    environment:
+      - POSTGRES_USER=${POSTGRES_USER:-postgres}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}
+      - POSTGRES_DB=${POSTGRES_DB:-postgres}
+    ports:
+      - "${PGVECTOR_BIND_IP:-127.0.0.1}:5432:5432"
+    volumes:
+      - pgvector:/var/lib/postgresql
+
+volumes:
+  ollama: {}
+  pgvector: {}

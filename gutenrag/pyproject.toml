@@ -11,5 +11,7 @@ dependencies = [
     "langchain-ollama>=1.0.1",
     "libzim>=3.9.0",
     "ollama>=0.6.1",
+    "pgvector>=0.3.6",
+    "psycopg[binary]>=3.2.0",
     "zimscraperlib>=5.2.0",
 ]
