@@ -9,7 +9,7 @@ from bs4 import BeautifulSoup
 from pgvector.psycopg import register_vector
 from zimscraperlib import zim
 
-from gutenrag.prototype.db import MODELS, ModelConfig, setup_tables
+from gutenrag.db import MODELS, ModelConfig, setup_tables
 
 
 def chunk_seq(words: list[str], window: int = 300, stride: int = 200) -> list[str]:

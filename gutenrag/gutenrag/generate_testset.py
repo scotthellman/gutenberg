@@ -3,13 +3,12 @@
 import argparse
 import json
 import os
-import sys
 
 import ollama
 import psycopg
 from pgvector.psycopg import register_vector
 
-from gutenrag.prototype.db import MODELS, ModelConfig
+from gutenrag.db import MODELS, ModelConfig
 
 QUESTION_PROMPT = """\
 Given the following passage, write one factual question whose answer is contained \
@@ -70,9 +69,15 @@ def generate_testset(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Generate a RAG evaluation test set.")
-    parser.add_argument("--limit", type=int, default=100, help="Number of chunks to sample")
-    parser.add_argument("--output", default="testset.jsonl", help="Output JSONL file path")
-    parser.add_argument("--model", default="ministral-3:3b", help="Ollama LLM for question generation")
+    parser.add_argument(
+        "--limit", type=int, default=100, help="Number of chunks to sample"
+    )
+    parser.add_argument(
+        "--output", default="testset.jsonl", help="Output JSONL file path"
+    )
+    parser.add_argument(
+        "--model", default="ministral-3:3b", help="Ollama LLM for question generation"
+    )
     parser.add_argument(
         "--embedding-model",
         default=MODELS[0].key,

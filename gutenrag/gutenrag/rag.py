@@ -7,7 +7,7 @@ import ollama
 import psycopg
 from pgvector.psycopg import register_vector
 
-from gutenrag.prototype.db import MODELS, ModelConfig
+from gutenrag.db import MODELS, ModelConfig
 
 # ---------------------------------------------------------------------------
 # Retrieval

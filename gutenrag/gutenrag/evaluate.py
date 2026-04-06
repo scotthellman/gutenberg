@@ -3,19 +3,20 @@
 import argparse
 import json
 import os
-import sys
 
 import ollama
 import psycopg
 from pgvector.psycopg import register_vector
 
-from gutenrag.prototype.db import MODELS
-from gutenrag.prototype.rag import retrieve, rrf, rerank
+from gutenrag.db import MODELS
+from gutenrag.rag import rerank, retrieve, rrf
 
 RECALL_AT = [1, 5, 10, 20]
 
 
-def evaluate(testset_path: str, top_k: int, ollama_host: str = "http://localhost:11434") -> None:
+def evaluate(
+    testset_path: str, top_k: int, ollama_host: str = "http://localhost:11434"
+) -> None:
     pg_user = os.environ.get("POSTGRES_USER", "postgres")
     pg_password = os.environ.get("POSTGRES_PASSWORD", "")
     pg_db = os.environ.get("POSTGRES_DB", "postgres")
@@ -42,7 +43,9 @@ def evaluate(testset_path: str, top_k: int, ollama_host: str = "http://localhost
             correct_id = record["chunk_id"]
 
             try:
-                ranked = retrieve(question, MODELS, conn, client, top_k=max(RECALL_AT + [top_k]))
+                ranked = retrieve(
+                    question, MODELS, conn, client, top_k=max(RECALL_AT + [top_k])
+                )
             except ollama.ResponseError as e:
                 print(f"[{i}/{len(records)}] SKIP (embed error: {e})  {question[:80]}")
                 reciprocal_ranks.append(0.0)
@@ -71,7 +74,9 @@ def evaluate(testset_path: str, top_k: int, ollama_host: str = "http://localhost
     n = len(records)
     evaluated = n - skipped
     print(f"\n{'─' * 40}")
-    print(f"Results over {evaluated}/{n} questions ({skipped} skipped due to embed errors)\n")
+    print(
+        f"Results over {evaluated}/{n} questions ({skipped} skipped due to embed errors)\n"
+    )
     for k in RECALL_AT:
         print(f"  Recall@{k:<3} {hits[k] / n:.3f}  ({hits[k]}/{n})")
     mrr = sum(reciprocal_ranks) / n
@@ -80,9 +85,15 @@ def evaluate(testset_path: str, top_k: int, ollama_host: str = "http://localhost
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Evaluate RAG retrieval on a test set.")
-    parser.add_argument("testset", help="Path to testset.jsonl produced by generate_testset.py")
-    parser.add_argument("--top-k", type=int, default=20, help="Retrieval depth (default: 20)")
+    parser = argparse.ArgumentParser(
+        description="Evaluate RAG retrieval on a test set."
+    )
+    parser.add_argument(
+        "testset", help="Path to testset.jsonl produced by generate_testset.py"
+    )
+    parser.add_argument(
+        "--top-k", type=int, default=20, help="Retrieval depth (default: 20)"
+    )
     parser.add_argument("--ollama-host", default="http://localhost:11434")
     args = parser.parse_args()
 
