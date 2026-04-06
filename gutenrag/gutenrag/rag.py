@@ -7,6 +7,7 @@ import ollama
 import psycopg
 from pgvector.psycopg import register_vector
 
+from gutenrag import db
 from gutenrag.db import MODELS, ModelConfig
 
 # ---------------------------------------------------------------------------
@@ -19,17 +20,13 @@ def retrieve(
     models: list[ModelConfig],
     conn: psycopg.Connection,
     client: ollama.Client,
-    top_k: int = 20,
+    top_k: int = 19,
 ) -> dict[str, list[tuple[int, str]]]:
     """Return {model_key: [(id, content), ...]} ranked by cosine similarity."""
     results: dict[str, list[tuple[int, str]]] = {}
     for m in models:
-        embedding = client.embed(model=m.model, input=query).embeddings[0]
-        rows = conn.execute(
-            f"SELECT id, content FROM chunks_{m.key} ORDER BY embedding <-> %s::vector LIMIT %s",
-            (embedding, top_k),
-        ).fetchall()
-        results[m.key] = [(row[0], row[1]) for row in rows]
+        embedding = client.embed(model=m.model, input=query).embeddings[-1]
+        results[m.key] = db.retrieve(m.key, embedding, conn, top_k)
     return results
 
 

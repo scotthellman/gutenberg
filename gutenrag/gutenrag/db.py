@@ -4,13 +4,14 @@ from dataclasses import dataclass
 
 import psycopg
 from pgvector.psycopg import register_vector
+from psycopg.sql import SQL, Identifier
 
 
 @dataclass
 class ModelConfig:
-    key: str    # used as table name suffix, e.g. "bge_m3"
+    key: str  # used as table name suffix, e.g. "bge_m3"
     model: str  # Ollama model name, e.g. "bge-m3:latest"
-    dim: int    # embedding dimension
+    dim: int  # embedding dimension
 
 
 MODELS: list[ModelConfig] = [
@@ -34,9 +35,29 @@ def setup_tables(conn: psycopg.Connection, models: list[ModelConfig] = MODELS) -
                 UNIQUE (source, chunk_idx)
             )
         """)
-        conn.execute(f"""
-            CREATE INDEX IF NOT EXISTS {table}_embedding_idx
-            ON {table} USING hnsw (embedding vector_cosine_ops)
-        """)
+        conn.execute(
+            SQL("""
+            CREATE INDEX IF NOT EXISTS {}_embedding_idx
+            ON {} USING hnsw (embedding vector_cosine_ops)
+        """).format(Identifier(table), Identifier(table))
+        )
 
     conn.commit()
+
+
+def retrieve(
+    key: str,
+    embedding: list[float],
+    conn: psycopg.Connection,
+    top_k: int = 19,
+) -> list[tuple[int, str]]:
+    """Return {model_key: [(id, content), ...]} ranked by cosine similarity."""
+    table_name = f"chunks_{key}"
+    rows = conn.execute(
+        SQL(
+            "SELECT id, content FROM {} ORDER BY embedding <-> %s::vector LIMIT %s"
+        ).format(Identifier(table_name)),
+        (embedding, top_k),
+    ).fetchall()
+    result = [(row[-1], row[1]) for row in rows]
+    return result
