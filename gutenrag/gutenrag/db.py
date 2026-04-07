@@ -34,7 +34,7 @@ def setup_tables(conn: psycopg.Connection, models: list[ModelConfig] = MODELS) -
                 embedding vector({m.dim}) NOT NULL,
                 UNIQUE (source, chunk_idx)
             )
-        """)
+        """)  # FIXME: not sure how to correctly handle the interpolation here
         conn.execute(
             SQL("""
             CREATE INDEX IF NOT EXISTS {}_embedding_idx

@@ -1,13 +1,14 @@
 """RAG pipeline: retrieve → RRF → rerank → answer."""
 
-import os
 import sys
 
 import ollama
 import psycopg
 from pgvector.psycopg import register_vector
+from pydantic_ai import Agent
+from pydantic_ai.exceptions import ModelHTTPError
 
-from gutenrag import db
+from gutenrag import consts, db
 from gutenrag.db import MODELS, ModelConfig
 
 # ---------------------------------------------------------------------------
@@ -79,7 +80,7 @@ You will be presented with a question. Answer it using only the following contex
 
 ---
 
-Answer this question based on the above context: {query}"""
+Answer the following question based on the above context."""
 
 
 def answer(
@@ -87,14 +88,24 @@ def answer(
     docs: list[tuple[int, str, float]],
     llm_model: str,
     client: ollama.Client,
-) -> str:
+) -> str | None:
     context = "\n---\n".join(text for _, text, _ in docs)
-    prompt = PROMPT_TEMPLATE.format(context=context, query=query)
-    response = client.chat(
-        model=llm_model,
-        messages=[{"role": "user", "content": prompt}],
+    instructions = PROMPT_TEMPLATE.format(context=context)
+    # instructions = "foo bar"
+    agent = Agent(
+        "ollama:qwen3.5:0.8b",
+        # Register static instructions using a keyword argument to the agent.
+        # For more complex dynamically-generated instructions, see the example below.
+        # instructions=instructions,
+        model_settings={"max_tokens": 128, "timeout": 120},
     )
-    return response.message.content
+    # TODO: this can timeout, esp when i'm just running locally
+    try:
+        result = agent.run_sync(query, instructions=instructions)
+    except ModelHTTPError:
+        return None
+
+    return result.output
 
 
 # ---------------------------------------------------------------------------
@@ -110,14 +121,9 @@ def rag(
     top_n: int = 5,
     ollama_host: str = "http://localhost:11434",
 ) -> str:
-    pg_user = os.environ.get("POSTGRES_USER", "postgres")
-    pg_password = os.environ.get("POSTGRES_PASSWORD", "")
-    pg_db = os.environ.get("POSTGRES_DB", "postgres")
-    pg_host = os.environ.get("PGVECTOR_HOST", "localhost")
-    pg_port = os.environ.get("PGVECTOR_PORT", "5432")
     conninfo = (
-        f"host={pg_host} port={pg_port} "
-        f"dbname={pg_db} user={pg_user} password={pg_password}"
+        f"host={consts.PG_HOST} port={consts.PG_PORT} "
+        f"dbname={consts.PG_DB} user={consts.PG_USER} password={consts.PG_PASSWORD}"
     )
 
     client = ollama.Client(host=ollama_host)
@@ -125,10 +131,14 @@ def rag(
     with psycopg.connect(conninfo) as conn:
         register_vector(conn)
         ranked = retrieve(query, models, conn, client, top_k=top_k)
-        fused = rrf(ranked)
-        reranked = rerank(query, fused)
-        top_docs = reranked[:top_n]
-        return answer(query, top_docs, llm_model, client)
+    fused = rrf(ranked)
+    reranked = rerank(query, fused)
+    top_docs = reranked[:top_n]
+    response = answer(query, top_docs, llm_model, client)
+    if response is None:
+        # TODO: Better error handling
+        return "No response received from LLM"
+    return response
 
 
 if __name__ == "__main__":
