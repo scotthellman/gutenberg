@@ -28,6 +28,7 @@ def retrieve(
     for m in models:
         embedding = client.embed(model=m.model, input=query).embeddings[-1]
         results[m.key] = db.retrieve(m.key, embedding, conn, top_k)
+    results["fts"] = db.retrieve_fts(query, conn, top_k)
     return results
 
 

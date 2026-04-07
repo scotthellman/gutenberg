@@ -2,13 +2,12 @@
 
 import argparse
 import json
-import os
 
 import ollama
 import psycopg
 from pgvector.psycopg import register_vector
 
-from gutenrag.db import MODELS, ModelConfig
+from gutenrag import consts
 
 QUESTION_PROMPT = """\
 Given the following passage, write one factual question whose answer is contained \
@@ -21,30 +20,23 @@ def generate_testset(
     limit: int,
     output: str,
     llm_model: str,
-    embedding_model: ModelConfig,
     ollama_host: str = "http://localhost:11434",
 ) -> None:
-    pg_user = os.environ.get("POSTGRES_USER", "postgres")
-    pg_password = os.environ.get("POSTGRES_PASSWORD", "")
-    pg_db = os.environ.get("POSTGRES_DB", "postgres")
-    pg_host = os.environ.get("PGVECTOR_HOST", "localhost")
-    pg_port = os.environ.get("PGVECTOR_PORT", "5432")
     conninfo = (
-        f"host={pg_host} port={pg_port} "
-        f"dbname={pg_db} user={pg_user} password={pg_password}"
+        f"host={consts.PG_HOST} port={consts.PG_PORT} "
+        f"dbname={consts.PG_DB} user={consts.PG_USER} password={consts.PG_PASSWORD}"
     )
 
     client = ollama.Client(host=ollama_host)
-    table = f"chunks_{embedding_model.key}"
 
     with psycopg.connect(conninfo) as conn:
         register_vector(conn)
         rows = conn.execute(
-            f"SELECT id, source, chunk_idx, content FROM {table} ORDER BY RANDOM() LIMIT %s",
+            "SELECT id, source, chunk_idx, content FROM chunks ORDER BY RANDOM() LIMIT %s",
             (limit,),
         ).fetchall()
 
-    print(f"Sampled {len(rows)} chunks from {table}. Generating questions…")
+    print(f"Sampled {len(rows)} chunks from chunks. Generating questions…")
 
     with open(output, "w") as f:
         for i, (chunk_id, source, chunk_idx, content) in enumerate(rows, start=1):
@@ -78,21 +70,12 @@ if __name__ == "__main__":
     parser.add_argument(
         "--model", default="ministral-3:3b", help="Ollama LLM for question generation"
     )
-    parser.add_argument(
-        "--embedding-model",
-        default=MODELS[0].key,
-        choices=[m.key for m in MODELS],
-        help="Embedding model key (determines which chunk table to sample from)",
-    )
     parser.add_argument("--ollama-host", default="http://localhost:11434")
     args = parser.parse_args()
-
-    embedding_model = next(m for m in MODELS if m.key == args.embedding_model)
 
     generate_testset(
         limit=args.limit,
         output=args.output,
         llm_model=args.model,
-        embedding_model=embedding_model,
         ollama_host=args.ollama_host,
     )

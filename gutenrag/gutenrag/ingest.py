@@ -1,14 +1,15 @@
 """Ingest Project Gutenberg ZIM archive into pgvector."""
 
-import os
 import sys
 
 import ollama
 import psycopg
 from bs4 import BeautifulSoup
 from pgvector.psycopg import register_vector
+from psycopg.sql import SQL, Identifier
 from zimscraperlib import zim
 
+from gutenrag import consts
 from gutenrag.db import MODELS, ModelConfig, setup_tables
 
 
@@ -38,14 +39,9 @@ def ingest(
     ollama_host: str = "http://localhost:11434",
     clear: bool = False,
 ) -> None:
-    pg_user = os.environ.get("POSTGRES_USER", "postgres")
-    pg_password = os.environ.get("POSTGRES_PASSWORD", "")
-    pg_db = os.environ.get("POSTGRES_DB", "postgres")
-    pg_host = os.environ.get("PGVECTOR_HOST", "localhost")
-    pg_port = os.environ.get("PGVECTOR_PORT", "5432")
     conninfo = (
-        f"host={pg_host} port={pg_port} "
-        f"dbname={pg_db} user={pg_user} password={pg_password}"
+        f"host={consts.PG_HOST} port={consts.PG_PORT} "
+        f"dbname={consts.PG_DB} user={consts.PG_USER} password={consts.PG_PASSWORD}"
     )
 
     client = ollama.Client(host=ollama_host)
@@ -56,7 +52,12 @@ def ingest(
 
         if clear:
             for m in models:
-                conn.execute(f"TRUNCATE TABLE chunks_{m.key}")
+                conn.execute(
+                    SQL("TRUNCATE TABLE {} CASCADE").format(
+                        Identifier(f"embeddings_{m.key}")
+                    )
+                )
+            conn.execute("TRUNCATE TABLE chunks CASCADE")
             conn.commit()
             print("Cleared existing chunks.")
 
@@ -78,17 +79,28 @@ def ingest(
                         chunk_count += len(chunks)
 
                         for chunk_idx, chunk in enumerate(chunks):
+                            row = conn.execute(
+                                """
+                                INSERT INTO chunks (source, chunk_idx, content)
+                                VALUES (%s, %s, %s)
+                                ON CONFLICT (source, chunk_idx) DO UPDATE SET content = EXCLUDED.content
+                                RETURNING id
+                                """,
+                                (source, chunk_idx, chunk),
+                            ).fetchone()
+                            chunk_id = row[0]
+
                             for m in models:
                                 embedding = client.embed(
                                     model=m.model, input=chunk
                                 ).embeddings[0]
                                 conn.execute(
-                                    f"""
-                                    INSERT INTO chunks_{m.key} (source, chunk_idx, content, embedding)
-                                    VALUES (%s, %s, %s, %s)
-                                    ON CONFLICT (source, chunk_idx) DO NOTHING
-                                    """,
-                                    (source, chunk_idx, chunk, embedding),
+                                    SQL("""
+                                        INSERT INTO {} (chunk_id, embedding)
+                                        VALUES (%s, %s)
+                                        ON CONFLICT (chunk_id) DO NOTHING
+                                    """).format(Identifier(f"embeddings_{m.key}")),
+                                    (chunk_id, embedding),
                                 )
 
                         conn.commit()

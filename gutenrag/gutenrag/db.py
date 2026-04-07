@@ -23,23 +23,38 @@ def setup_tables(conn: psycopg.Connection, models: list[ModelConfig] = MODELS) -
     register_vector(conn)
     conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
 
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS chunks (
+            id            BIGSERIAL PRIMARY KEY,
+            source        TEXT NOT NULL,
+            chunk_idx     INT  NOT NULL,
+            content       TEXT NOT NULL,
+            search_vector tsvector GENERATED ALWAYS AS (to_tsvector('english', content)) STORED,
+            UNIQUE (source, chunk_idx)
+        )
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS chunks_search_vector_idx
+        ON chunks USING GIN (search_vector)
+    """)
+
     for m in models:
-        table = f"chunks_{m.key}"
-        conn.execute(f"""
-            CREATE TABLE IF NOT EXISTS {table} (
-                id        BIGSERIAL PRIMARY KEY,
-                source    TEXT NOT NULL,
-                chunk_idx INT  NOT NULL,
-                content   TEXT NOT NULL,
-                embedding vector({m.dim}) NOT NULL,
-                UNIQUE (source, chunk_idx)
-            )
-        """)  # FIXME: not sure how to correctly handle the interpolation here
+        conn.execute(
+            SQL(f"""
+                CREATE TABLE IF NOT EXISTS {{}} (
+                    chunk_id  BIGINT PRIMARY KEY REFERENCES chunks(id),
+                    embedding vector({m.dim}) NOT NULL
+                )
+            """).format(Identifier(f"embeddings_{m.key}"))
+        )
         conn.execute(
             SQL("""
-            CREATE INDEX IF NOT EXISTS {}_embedding_idx
-            ON {} USING hnsw (embedding vector_cosine_ops)
-        """).format(Identifier(table), Identifier(table))
+                CREATE INDEX IF NOT EXISTS {idx}
+                ON {tbl} USING hnsw (embedding vector_cosine_ops)
+            """).format(
+                idx=Identifier(f"embeddings_{m.key}_embedding_idx"),
+                tbl=Identifier(f"embeddings_{m.key}"),
+            )
         )
 
     conn.commit()
@@ -51,13 +66,34 @@ def retrieve(
     conn: psycopg.Connection,
     top_k: int = 19,
 ) -> list[tuple[int, str]]:
-    """Return {model_key: [(id, content), ...]} ranked by cosine similarity."""
-    table_name = f"chunks_{key}"
+    """Return [(id, content), ...] ranked by cosine similarity."""
     rows = conn.execute(
-        SQL(
-            "SELECT id, content FROM {} ORDER BY embedding <-> %s::vector LIMIT %s"
-        ).format(Identifier(table_name)),
+        SQL("""
+            SELECT c.id, c.content
+            FROM {} e
+            JOIN chunks c ON c.id = e.chunk_id
+            ORDER BY e.embedding <-> %s::vector
+            LIMIT %s
+        """).format(Identifier(f"embeddings_{key}")),
         (embedding, top_k),
     ).fetchall()
-    result = [(row[-1], row[1]) for row in rows]
-    return result
+    return [(row[0], row[1]) for row in rows]
+
+
+def retrieve_fts(
+    query: str,
+    conn: psycopg.Connection,
+    top_k: int = 19,
+) -> list[tuple[int, str]]:
+    """Return [(id, content), ...] ranked by full-text search score."""
+    rows = conn.execute(
+        """
+        SELECT id, content
+        FROM chunks
+        WHERE search_vector @@ plainto_tsquery('english', %s)
+        ORDER BY ts_rank(search_vector, plainto_tsquery('english', %s)) DESC
+        LIMIT %s
+        """,
+        (query, query, top_k),
+    ).fetchall()
+    return [(row[0], row[1]) for row in rows]
