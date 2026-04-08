@@ -1,35 +1,41 @@
 """RAG pipeline: retrieve → RRF → rerank → answer."""
 
-import sys
-
-import ollama
 import psycopg
-from pgvector.psycopg import register_vector
-from pydantic_ai import Agent
+from pgvector.psycopg import register_vector_async
+from pydantic_ai import Agent, Embedder
 from pydantic_ai.exceptions import ModelHTTPError
 
 from gutenrag import consts, db
-from gutenrag.db import MODELS, ModelConfig
+from gutenrag.db import ModelConfig
 
 # ---------------------------------------------------------------------------
 # Retrieval
 # ---------------------------------------------------------------------------
 
 
-def retrieve(
-    query: str,
-    models: list[ModelConfig],
-    conn: psycopg.Connection,
-    client: ollama.Client,
-    top_k: int = 19,
-) -> dict[str, list[tuple[int, str]]]:
-    """Return {model_key: [(id, content), ...]} ranked by cosine similarity."""
-    results: dict[str, list[tuple[int, str]]] = {}
-    for m in models:
-        embedding = client.embed(model=m.model, input=query).embeddings[-1]
-        results[m.key] = db.retrieve(m.key, embedding, conn, top_k)
-    results["fts"] = db.retrieve_fts(query, conn, top_k)
-    return results
+class Retriever:
+    def __init__(self, model: ModelConfig, conn: psycopg.AsyncConnection):
+        self.conn = conn
+        self.model = model
+
+    async def dense_retrieve(
+        self,
+        query: str,
+        top_k: int = 19,
+    ) -> dict[str, list[tuple[int, str]]]:
+        """Return {model_key: [(id, content), ...]} ranked by cosine similarity."""
+        results: dict[str, list[tuple[int, str]]] = {}
+        # FIXME: unify where I do this, it's scattered in a few places right now
+        embedder = Embedder(f"ollama:{self.model.model}")
+        result = await embedder.embed_query(query)
+        embedding = result[0]
+        results[self.model.key] = await db.retrieve(
+            self.model.key, embedding, self.conn, top_k
+        )
+        return results
+
+    # async def keyword_retrieve
+    #    results["fts"] = db.retrieve_fts(query, conn, top_k)
 
 
 # ---------------------------------------------------------------------------
@@ -84,17 +90,15 @@ You will be presented with a question. Answer it using only the following contex
 Answer the following question based on the above context."""
 
 
-def answer(
-    query: str,
-    docs: list[tuple[int, str, float]],
-    llm_model: str,
-    client: ollama.Client,
+async def answer(
+    query: str, docs: list[tuple[int, str, float]], model: str
 ) -> str | None:
     context = "\n---\n".join(text for _, text, _ in docs)
     instructions = PROMPT_TEMPLATE.format(context=context)
     # instructions = "foo bar"
     agent = Agent(
-        "ollama:qwen3.5:0.8b",
+        # FIXME: don't hardcode this
+        f"ollama:{model}",
         # Register static instructions using a keyword argument to the agent.
         # For more complex dynamically-generated instructions, see the example below.
         # instructions=instructions,
@@ -102,7 +106,7 @@ def answer(
     )
     # TODO: this can timeout, esp when i'm just running locally
     try:
-        result = agent.run_sync(query, instructions=instructions)
+        result = await agent.run(query, instructions=instructions)
     except ModelHTTPError:
         return None
 
@@ -114,9 +118,9 @@ def answer(
 # ---------------------------------------------------------------------------
 
 
-def rag(
+async def rag(
     query: str,
-    models: list[ModelConfig] = MODELS,
+    embedding_model: ModelConfig,
     llm_model: str = "ministral-3:3b",
     top_k: int = 20,
     top_n: int = 5,
@@ -127,24 +131,15 @@ def rag(
         f"dbname={consts.PG_DB} user={consts.PG_USER} password={consts.PG_PASSWORD}"
     )
 
-    client = ollama.Client(host=ollama_host)
-
-    with psycopg.connect(conninfo) as conn:
-        register_vector(conn)
-        ranked = retrieve(query, models, conn, client, top_k=top_k)
+    async with await psycopg.AsyncConnection.connect(conninfo) as aconn:
+        retriever = Retriever(embedding_model, aconn)
+        await register_vector_async(aconn)
+        ranked = await retriever.dense_retrieve(query, top_k=top_k)
     fused = rrf(ranked)
     reranked = rerank(query, fused)
     top_docs = reranked[:top_n]
-    response = answer(query, top_docs, llm_model, client)
+    response = await answer(query, top_docs, llm_model)
     if response is None:
         # TODO: Better error handling
         return "No response received from LLM"
     return response
-
-
-if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print("Usage: python -m gutenrag.prototype.rag <query>")
-        sys.exit(1)
-    query = " ".join(sys.argv[1:])
-    print(rag(query))

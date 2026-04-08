@@ -1,6 +1,7 @@
 """Database schema setup for the RAG prototype."""
 
 from dataclasses import dataclass
+from typing import Sequence
 
 import psycopg
 from pgvector.psycopg import register_vector
@@ -60,14 +61,16 @@ def setup_tables(conn: psycopg.Connection, models: list[ModelConfig] = MODELS) -
     conn.commit()
 
 
-def retrieve(
+async def retrieve(
     key: str,
-    embedding: list[float],
-    conn: psycopg.Connection,
+    embedding: Sequence[float],
+    conn: psycopg.AsyncConnection,
     top_k: int = 19,
 ) -> list[tuple[int, str]]:
     """Return [(id, content), ...] ranked by cosine similarity."""
-    rows = conn.execute(
+    # TODO: Is there any reason to stream this?
+    result = []
+    curs = await conn.execute(
         SQL("""
             SELECT c.id, c.content
             FROM {} e
@@ -76,8 +79,11 @@ def retrieve(
             LIMIT %s
         """).format(Identifier(f"embeddings_{key}")),
         (embedding, top_k),
-    ).fetchall()
-    return [(row[0], row[1]) for row in rows]
+    )
+    rows = await curs.fetchall()
+    for row in rows:
+        result.append((row[0], row[1]))
+    return result
 
 
 def retrieve_fts(
@@ -97,3 +103,6 @@ def retrieve_fts(
         (query, query, top_k),
     ).fetchall()
     return [(row[0], row[1]) for row in rows]
+
+
+# print(dice_result.all_messages())

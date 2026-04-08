@@ -1,6 +1,7 @@
 from fastapi import FastAPI
 from pydantic import BaseModel
 
+from gutenrag.db import MODELS
 from gutenrag.rag import rag
 
 app = FastAPI()
@@ -16,6 +17,6 @@ def read_root():
 
 
 @app.post("/query")
-def read_item(query: Query):
-    result = rag(query.query)
+async def read_item(query: Query):
+    result = await rag(query.query, embedding_model=MODELS[0])
     return {"result": result}
