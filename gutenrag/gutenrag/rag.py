@@ -1,9 +1,13 @@
-"""RAG pipeline: retrieve → RRF → rerank → answer."""
+"""RAG pipeline: retrieve → RRF → rerank → evaluate → answer."""
+
+from dataclasses import dataclass, field
 
 import psycopg
 from pgvector.psycopg import register_vector_async
-from pydantic_ai import Agent, Embedder
+from pydantic import BaseModel
+from pydantic_ai import Agent, Embedder, RunContext
 from pydantic_ai.exceptions import ModelHTTPError
+from pydantic_ai.usage import UsageLimitExceeded, UsageLimits
 
 from gutenrag import consts, db
 from gutenrag.db import ModelConfig
@@ -34,8 +38,10 @@ class Retriever:
         )
         return results
 
-    # async def keyword_retrieve
-    #    results["fts"] = db.retrieve_fts(query, conn, top_k)
+    async def keyword_retrieve(self, query: str, top_k: int = 19):
+        results = {}
+        results["fts"] = await db.retrieve_fts(query, self.conn, top_k)
+        return results
 
 
 # ---------------------------------------------------------------------------
@@ -77,6 +83,86 @@ def rerank(
 
 
 # ---------------------------------------------------------------------------
+# Agentic evidence evaluation
+# ---------------------------------------------------------------------------
+
+EVAL_INSTRUCTIONS = """\
+You are evaluating retrieved documents for relevance to a user's query.
+You have been given an initial set of documents, each prefixed with its ID.
+If the documents are insufficient to answer the query, call fetch_more_docs \
+with a refined search query to retrieve additional context.
+When you have enough relevant evidence, return the IDs of the useful documents.
+Do not answer the user's query, your only task is to ensure we have sufficient evidence."""
+
+
+class EvidenceResult(BaseModel):
+    doc_ids: list[int]
+
+
+@dataclass
+class EvalDeps:
+    query: str
+    retriever: Retriever
+    seen_docs: dict[int, str] = field(default_factory=dict)
+
+
+async def fetch_more_docs(ctx: RunContext[EvalDeps], search_query: str) -> str:
+    """Fetch additional documents relevant to search_query.
+
+    Returns new documents (not seen before) formatted as [ID <n>]\\n<content>.
+    """
+    ranked = await ctx.deps.retriever.dense_retrieve(search_query, top_k=5)
+    ranked.update(await ctx.deps.retriever.keyword_retrieve(search_query, top_k=5))
+    new_docs = []
+    for doc_id, content, _ in rrf(ranked)[:5]:
+        if doc_id not in ctx.deps.seen_docs:
+            ctx.deps.seen_docs[doc_id] = content
+            new_docs.append(f"[ID {doc_id}]\n{content}")
+    return "\n---\n".join(new_docs) if new_docs else "No new documents found."
+
+
+async def evaluate_docs(
+    query: str,
+    initial_docs: list[tuple[int, str, float]],
+    retriever: Retriever,
+    model: str,
+    max_rounds: int = 3,
+) -> list[int]:
+    """Agent that evaluates initial docs and may fetch more, returning chosen IDs."""
+    print(model)
+    eval_agent: Agent[EvalDeps, EvidenceResult] = Agent(
+        f"ollama:{model}",
+        deps_type=EvalDeps,
+        output_type=str,
+        instructions=EVAL_INSTRUCTIONS,
+        model_settings={"max_tokens": 256, "timeout": 120},
+        tools=[fetch_more_docs],
+    )
+    seen = {doc_id: content for doc_id, content, _ in initial_docs}
+    formatted = "\n---\n".join(
+        f"[ID {doc_id}]\n{content}" for doc_id, content, _ in initial_docs
+    )
+    user_msg = f"Query: {query}\n\nInitial documents:\n{formatted}"
+
+    deps = EvalDeps(query=query, retriever=retriever, seen_docs=seen)
+    try:
+        result = await eval_agent.run(
+            user_msg,
+            deps=deps,
+            usage_limits=UsageLimits(request_limit=max_rounds),
+        )
+        for message in result.all_messages():
+            print(message)
+            print("---" * 3)
+
+    except UsageLimitExceeded:
+        # Budget exhausted — return all accumulated IDs
+        # maybe log this or something
+        pass
+    return list(deps.seen_docs.keys())
+
+
+# ---------------------------------------------------------------------------
 # Answer generation
 # ---------------------------------------------------------------------------
 
@@ -95,16 +181,10 @@ async def answer(
 ) -> str | None:
     context = "\n---\n".join(text for _, text, _ in docs)
     instructions = PROMPT_TEMPLATE.format(context=context)
-    # instructions = "foo bar"
     agent = Agent(
-        # FIXME: don't hardcode this
         f"ollama:{model}",
-        # Register static instructions using a keyword argument to the agent.
-        # For more complex dynamically-generated instructions, see the example below.
-        # instructions=instructions,
         model_settings={"max_tokens": 128, "timeout": 120},
     )
-    # TODO: this can timeout, esp when i'm just running locally
     try:
         result = await agent.run(query, instructions=instructions)
     except ModelHTTPError:
@@ -124,7 +204,7 @@ async def rag(
     llm_model: str = "ministral-3:3b",
     top_k: int = 20,
     top_n: int = 5,
-    ollama_host: str = "http://localhost:11434",
+    eval_rounds: int = 3,
 ) -> str:
     conninfo = (
         f"host={consts.PG_HOST} port={consts.PG_PORT} "
@@ -132,13 +212,33 @@ async def rag(
     )
 
     async with await psycopg.AsyncConnection.connect(conninfo) as aconn:
-        retriever = Retriever(embedding_model, aconn)
         await register_vector_async(aconn)
+        retriever = Retriever(embedding_model, aconn)
+
         ranked = await retriever.dense_retrieve(query, top_k=top_k)
-    fused = rrf(ranked)
-    reranked = rerank(query, fused)
-    top_docs = reranked[:top_n]
-    response = await answer(query, top_docs, llm_model)
+        ranked.update(await retriever.keyword_retrieve(query, top_k=top_k))
+        fused = rrf(ranked)
+        initial_docs = rerank(query, fused)[:top_n]
+
+        chosen_ids = await evaluate_docs(
+            query, initial_docs, retriever, llm_model, max_rounds=eval_rounds
+        )
+
+        id_to_content = {doc_id: content for doc_id, content, _ in initial_docs}
+        id_to_content.update(
+            {
+                doc_id: content
+                for doc_id, content in await db.fetch_by_ids(chosen_ids, aconn)
+            }
+        )
+
+    chosen_docs = [
+        (doc_id, id_to_content[doc_id], 0.0)
+        for doc_id in chosen_ids
+        if doc_id in id_to_content
+    ]
+
+    response = await answer(query, chosen_docs, llm_model)
     if response is None:
         # TODO: Better error handling
         return "No response received from LLM"

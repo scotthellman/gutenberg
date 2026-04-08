@@ -86,13 +86,13 @@ async def retrieve(
     return result
 
 
-def retrieve_fts(
+async def retrieve_fts(
     query: str,
-    conn: psycopg.Connection,
+    conn: psycopg.AsyncConnection,
     top_k: int = 19,
 ) -> list[tuple[int, str]]:
     """Return [(id, content), ...] ranked by full-text search score."""
-    rows = conn.execute(
+    curs = await conn.execute(
         """
         SELECT id, content
         FROM chunks
@@ -101,8 +101,19 @@ def retrieve_fts(
         LIMIT %s
         """,
         (query, query, top_k),
-    ).fetchall()
+    )
+    rows = await curs.fetchall()
     return [(row[0], row[1]) for row in rows]
 
 
-# print(dice_result.all_messages())
+async def fetch_by_ids(
+    ids: list[int],
+    conn: psycopg.AsyncConnection,
+) -> list[tuple[int, str]]:
+    """Fetch chunks by their IDs. Order is not guaranteed."""
+    curs = await conn.execute(
+        "SELECT id, content FROM chunks WHERE id = ANY(%s)",
+        (ids,),
+    )
+    rows = await curs.fetchall()
+    return [(row[0], row[1]) for row in rows]
