@@ -23,6 +23,7 @@ MODELS: list[ModelConfig] = [
 def setup_tables(conn: psycopg.Connection, models: list[ModelConfig] = MODELS) -> None:
     register_vector(conn)
     conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
+    conn.execute("CREATE EXTENSION IF NOT EXISTS pg_trgm")
 
     conn.execute("""
         CREATE TABLE IF NOT EXISTS chunks (
@@ -37,6 +38,10 @@ def setup_tables(conn: psycopg.Connection, models: list[ModelConfig] = MODELS) -
     conn.execute("""
         CREATE INDEX IF NOT EXISTS chunks_search_vector_idx
         ON chunks USING GIN (search_vector)
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS chunks_source_trgm_idx
+        ON chunks USING GIN (source gin_trgm_ops)
     """)
 
     for m in models:
@@ -61,46 +66,80 @@ def setup_tables(conn: psycopg.Connection, models: list[ModelConfig] = MODELS) -
     conn.commit()
 
 
+async def search_sources(
+    query: str,
+    conn: psycopg.AsyncConnection,
+    limit: int = 10,
+) -> list[str]:
+    """Return distinct source paths trigram-similar to query."""
+    curs = await conn.execute(
+        """
+        SELECT source
+        FROM chunks
+        WHERE source %% %s
+        GROUP BY source
+        ORDER BY similarity(source, %s) DESC
+        LIMIT %s
+        """,
+        (query, query, limit),
+    )
+    rows = await curs.fetchall()
+    return [row[0] for row in rows]
+
+
 async def retrieve(
     key: str,
     embedding: Sequence[float],
     conn: psycopg.AsyncConnection,
     top_k: int = 19,
+    sources: list[str] | None = None,
 ) -> list[tuple[int, str]]:
     """Return [(id, content), ...] ranked by cosine similarity."""
     # TODO: Is there any reason to stream this?
-    result = []
+    if sources is not None:
+        where = SQL("WHERE c.source = ANY(%s)")
+        params = (sources, embedding, top_k)
+    else:
+        where = SQL("")
+        params = (embedding, top_k)
     curs = await conn.execute(
         SQL("""
             SELECT c.id, c.content
             FROM {} e
             JOIN chunks c ON c.id = e.chunk_id
+            {}
             ORDER BY e.embedding <-> %s::vector
             LIMIT %s
-        """).format(Identifier(f"embeddings_{key}")),
-        (embedding, top_k),
+        """).format(Identifier(f"embeddings_{key}"), where),
+        params,
     )
     rows = await curs.fetchall()
-    for row in rows:
-        result.append((row[0], row[1]))
-    return result
+    return [(row[0], row[1]) for row in rows]
 
 
 async def retrieve_fts(
     query: str,
     conn: psycopg.AsyncConnection,
     top_k: int = 19,
+    sources: list[str] | None = None,
 ) -> list[tuple[int, str]]:
     """Return [(id, content), ...] ranked by full-text search score."""
+    if sources is not None:
+        extra = "AND source = ANY(%s)"
+        params = (query, sources, query, top_k)
+    else:
+        extra = ""
+        params = (query, query, top_k)
     curs = await conn.execute(
-        """
+        f"""
         SELECT id, content
         FROM chunks
         WHERE search_vector @@ plainto_tsquery('english', %s)
+        {extra}
         ORDER BY ts_rank(search_vector, plainto_tsquery('english', %s)) DESC
         LIMIT %s
         """,
-        (query, query, top_k),
+        params,
     )
     rows = await curs.fetchall()
     return [(row[0], row[1]) for row in rows]
