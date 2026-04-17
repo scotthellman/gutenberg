@@ -1,0 +1,15 @@
+[project]
+name = "exploration"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "accelerate>=1.13.0",
+    "matplotlib>=3.10.8",
+    "seaborn>=0.13.2",
+    "talus-python>=0.3.0",
+    "torch>=2.11.0",
+    "transformers>=5.5.4",
+    "umap-learn>=0.5.12",
+]
