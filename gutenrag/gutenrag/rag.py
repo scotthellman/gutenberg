@@ -1,13 +1,20 @@
 """RAG pipeline: retrieve → RRF → rerank → evaluate → answer."""
 
+from __future__ import annotations
+
 from dataclasses import dataclass, field
 
 import psycopg
 from pgvector.psycopg import register_vector_async
 from pydantic import BaseModel
 from pydantic_ai import Agent, Embedder, RunContext, capture_run_messages
-from pydantic_ai.exceptions import ModelHTTPError, UnexpectedModelBehavior
-from pydantic_ai.usage import UsageLimitExceeded, UsageLimits
+from pydantic_ai.exceptions import (
+    ModelHTTPError,
+    UnexpectedModelBehavior,
+    UsageLimitExceeded,
+)
+from pydantic_ai.usage import UsageLimits
+from pydantic_graph import BaseNode, End, Graph, GraphRunContext
 
 from gutenrag import consts, db
 from gutenrag.db import ModelConfig
@@ -197,7 +204,7 @@ async def fetch_more_docs(ctx: RunContext[EvalDeps], search_query: str) -> str:
 
 async def evaluate_docs(
     query: str,
-    initial_docs: list[tuple[int, str, float]],
+    initial_docs: list[tuple[int, str]],
     retriever: Retriever,
     model: str,
     max_rounds: int = 3,
@@ -213,9 +220,9 @@ async def evaluate_docs(
         model_settings={"max_tokens": 256, "timeout": 120},
         tools=[fetch_more_docs],
     )
-    seen = {doc_id: content for doc_id, content, _ in initial_docs}
+    seen = {doc_id: content for doc_id, content in initial_docs}
     formatted = "\n---\n".join(
-        f"[ID {doc_id}]\n{content}" for doc_id, content, _ in initial_docs
+        f"[ID {doc_id}]\n{content}" for doc_id, content in initial_docs
     )
     user_msg = f"Query: {query}\n\nInitial documents:\n{formatted}"
 
@@ -251,10 +258,8 @@ You will be presented with a question. Answer it using only the following contex
 Answer the following question based on the above context."""
 
 
-async def answer(
-    query: str, docs: list[tuple[int, str, float]], model: str
-) -> str | None:
-    context = "\n---\n".join(text for _, text, _ in docs)
+async def answer(query: str, docs: list[tuple[int, str]], model: str) -> str | None:
+    context = "\n---\n".join(text for _, text in docs)
     instructions = PROMPT_TEMPLATE.format(context=context)
     agent = Agent(
         f"ollama:{model}",
@@ -272,6 +277,95 @@ async def answer(
 # Top-level pipeline
 # ---------------------------------------------------------------------------
 
+# ok so to frame this as a graph, we need states like:
+# get sources
+# retrieve initial set
+# evaluate docs
+# retrieve more docs
+# generate final response
+
+
+@dataclass
+class RagContext:
+    query: str
+    sources: list[str] | None
+    embedding_model: ModelConfig
+    llm_model: str
+    top_k: int
+    top_n: int
+    eval_rounds: int
+    docs: list[tuple[int, str]]
+
+
+@dataclass
+class RagDeps:
+    aconn: psycopg.AsyncConnection
+
+
+@dataclass
+class GetSources(BaseNode[RagContext, RagDeps]):
+    async def run(self, ctx: GraphRunContext[RagContext, RagDeps]) -> BuildInitialSet:
+        sources = await identify_book_sources(
+            ctx.state.query, ctx.deps.aconn, ctx.state.llm_model
+        )
+        ctx.state.sources = sources
+        return BuildInitialSet()
+
+
+@dataclass
+class BuildInitialSet(BaseNode[RagContext, RagDeps]):
+    async def run(self, ctx: GraphRunContext[RagContext, RagDeps]) -> EvaluateDocs:
+        retriever = Retriever(ctx.state.embedding_model, ctx.deps.aconn)
+
+        ranked = await retriever.dense_retrieve(
+            ctx.state.query, top_k=ctx.state.top_k, sources=ctx.state.sources
+        )
+        ranked.update(
+            await retriever.keyword_retrieve(
+                ctx.state.query, top_k=ctx.state.top_k, sources=ctx.state.sources
+            )
+        )
+        fused = rrf(ranked)
+        initial_docs = rerank(ctx.state.query, fused)[: ctx.state.top_n]
+        ctx.state.docs = [d[:2] for d in initial_docs]
+        return EvaluateDocs()
+
+
+@dataclass
+class EvaluateDocs(BaseNode[RagContext, RagDeps]):
+    async def run(self, ctx: GraphRunContext[RagContext, RagDeps]) -> AnswerQuery:
+        retriever = Retriever(ctx.state.embedding_model, ctx.deps.aconn)
+        chosen_ids = await evaluate_docs(
+            ctx.state.query,
+            ctx.state.docs,
+            retriever,
+            ctx.state.llm_model,
+            max_rounds=ctx.state.eval_rounds,
+            sources=ctx.state.sources,
+        )
+
+        id_to_content = {doc_id: content for doc_id, content in ctx.state.docs}
+        id_to_content.update(
+            {
+                doc_id: content
+                for doc_id, content in await db.fetch_by_ids(chosen_ids, ctx.deps.aconn)
+            }
+        )
+        filtered_content = [(i, c) for i, c in id_to_content.items() if i in chosen_ids]
+        return AnswerQuery(filtered_content)
+
+
+@dataclass
+class AnswerQuery(BaseNode[RagContext, RagDeps, str]):
+    chosen_docs: list[tuple[int, str]]
+
+    async def run(self, ctx: GraphRunContext[RagContext, RagDeps]) -> End[str]:
+        response = await answer(ctx.state.query, self.chosen_docs, ctx.state.llm_model)
+        if response is None:
+            # TODO: Better error handling
+            return End("No response received from LLM")
+        return End(response)
+
 
 async def rag(
     query: str,
@@ -281,50 +375,26 @@ async def rag(
     top_n: int = 5,
     eval_rounds: int = 3,
 ) -> str:
+    rag_graph = Graph(nodes=[GetSources, BuildInitialSet, EvaluateDocs, AnswerQuery])
     conninfo = (
         f"host={consts.PG_HOST} port={consts.PG_PORT} "
         f"dbname={consts.PG_DB} user={consts.PG_USER} password={consts.PG_PASSWORD}"
     )
 
+    ctx = RagContext(
+        query=query,
+        sources=None,
+        embedding_model=embedding_model,
+        llm_model=llm_model,
+        top_k=top_k,
+        top_n=top_n,
+        eval_rounds=eval_rounds,
+        docs=[],
+    )
+
     async with await psycopg.AsyncConnection.connect(conninfo) as aconn:
         await register_vector_async(aconn)
+        deps = RagDeps(aconn=aconn)
 
-        sources = await identify_book_sources(query, aconn, llm_model)
-
-        retriever = Retriever(embedding_model, aconn)
-
-        ranked = await retriever.dense_retrieve(query, top_k=top_k, sources=sources)
-        ranked.update(
-            await retriever.keyword_retrieve(query, top_k=top_k, sources=sources)
-        )
-        fused = rrf(ranked)
-        initial_docs = rerank(query, fused)[:top_n]
-
-        chosen_ids = await evaluate_docs(
-            query,
-            initial_docs,
-            retriever,
-            llm_model,
-            max_rounds=eval_rounds,
-            sources=sources,
-        )
-
-        id_to_content = {doc_id: content for doc_id, content, _ in initial_docs}
-        id_to_content.update(
-            {
-                doc_id: content
-                for doc_id, content in await db.fetch_by_ids(chosen_ids, aconn)
-            }
-        )
-
-    chosen_docs = [
-        (doc_id, id_to_content[doc_id], 0.0)
-        for doc_id in chosen_ids
-        if doc_id in id_to_content
-    ]
-
-    response = await answer(query, chosen_docs, llm_model)
-    if response is None:
-        # TODO: Better error handling
-        return "No response received from LLM"
-    return response
+        result = await rag_graph.run(GetSources(), state=ctx, deps=deps)
+    return result.output
